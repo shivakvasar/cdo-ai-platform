@@ -13,52 +13,40 @@ import anthropic
 import pandas as pd
 import streamlit as st
 
+import mapper_agent
+from pii import scrub_pii
+
 # --- Constants ---------------------------------------------------------------
 MODEL = "claude-sonnet-4-5"
-DATA_DIR = Path(__file__).parent / "data"  # where the Importer saves mapped output
-
-CANONICAL_FIELDS = ("Customer", "Job", "Invoice", "Payment", "Task", "Vendor", "VendorID")
-
-MAPPER_SYSTEM_PROMPT = f"""You are a data mapper. Given CSV/XLSX headers and sample values,
-return a JSON array mapping each source column to a canonical field.
-
-Canonical fields: {", ".join(CANONICAL_FIELDS)}, Unknown
-
-Return ONLY a JSON array. No explanation. Each item must have:
-- "source_column": the original header name
-- "canonical_field": the best matching canonical field
-- "confidence": a float between 0.0 and 1.0"""
-
+DATA_DIR = Path(__file__).parent / "data"  # confirmed mappings the Workspace reads
+UPLOAD_DIR = Path(__file__).parent / "uploads"  # raw files, so mapper_agent has a filepath to read
+STAGING_DIR = DATA_DIR / "_staging"  # mapper_agent output pending user Confirm; a
+# subdir of DATA_DIR so list_mapped_files()'s non-recursive glob skips it automatically
 
 # --- Shared helpers ------------------------------------------------------------
 
-def get_client() -> anthropic.Anthropic | None:
-    """Build an Anthropic client from an API key, wherever it comes from.
+def get_api_key() -> str | None:
+    """The Anthropic API key, wherever it comes from.
 
-    Streamlit reruns this whole script top-to-bottom every time the user
-    interacts with a widget, so this needs to be cheap to call repeatedly.
     Checks the ANTHROPIC_API_KEY environment variable first (e.g. set via a
     .env-loaded shell); falls back to the sidebar text input in
     render_sidebar() so the app still works the very first time, before
-    anyone has set up a .env file. Returns None (rather than raising) when
-    no key is available yet, so callers can show a friendly message instead
-    of crashing the whole page.
+    anyone has set up a .env file. Returns None when no key is available yet,
+    so callers can show a friendly message instead of crashing the page.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY") or st.session_state.get("api_key")
+    return os.environ.get("ANTHROPIC_API_KEY") or st.session_state.get("api_key") or None
+
+
+def get_client() -> anthropic.Anthropic | None:
+    """Build an Anthropic client from get_api_key(), or None if no key is set yet.
+
+    Streamlit reruns this whole script top-to-bottom every time the user
+    interacts with a widget, so this needs to be cheap to call repeatedly.
+    """
+    api_key = get_api_key()
     if not api_key:
         return None
     return anthropic.Anthropic(api_key=api_key)
-
-
-def clean_json_response(text: str) -> str:
-    """Strip optional ```json ... ``` fences before parsing a Claude reply as JSON."""
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text.rsplit("```", 1)[0]
-        text = text.strip()
-    return text
 
 
 def load_dataframe(uploaded_file) -> pd.DataFrame:
@@ -101,7 +89,7 @@ def render_sidebar() -> str:
 
 def render_importer():
     st.header("Importer")
-    st.write("Upload a CSV or XLSX file and map its columns to canonical fields using Claude.")
+    st.write("Upload a CSV or XLSX file and map its columns to canonical fields using mapper_agent.")
 
     uploaded_file = st.file_uploader("Choose a file", type=["csv", "xlsx", "xls"])
     if uploaded_file is None:
@@ -111,28 +99,47 @@ def render_importer():
     st.subheader("Preview")
     st.dataframe(df.head())
 
-    if st.button("Map columns with Claude"):
-        client = get_client()
-        if client is None:
+    stem = Path(uploaded_file.name).stem
+
+    if st.button("Run mapper_agent"):
+        api_key = get_api_key()
+        if api_key is None:
             st.error("Set an Anthropic API key in the sidebar first.")
             return
 
-        # First 3 non-null sample values per column give Claude enough
-        # context to guess the right canonical field without sending the
-        # whole file.
-        samples = {col: df[col].dropna().astype(str).tolist()[:3] for col in df.columns}
-        user_message = "Headers and sample values:\n" + "\n".join(
-            f"- '{col}': {samples.get(col, [])}" for col in df.columns
+        # mapper_agent works off filepaths (it re-reads the file itself via its
+        # own load_headers tool), so the in-memory upload needs to land on disk
+        # first. mapper_agent.client is built at import time from whatever
+        # ANTHROPIC_API_KEY happened to be set then, which may predate a key
+        # typed into the sidebar — rebuild it here so it's never stale.
+        UPLOAD_DIR.mkdir(exist_ok=True)
+        upload_path = UPLOAD_DIR / uploaded_file.name
+        upload_path.write_bytes(uploaded_file.getvalue())
+
+        os.environ["ANTHROPIC_API_KEY"] = api_key
+        mapper_agent.client = anthropic.Anthropic(api_key=api_key)
+
+        STAGING_DIR.mkdir(parents=True, exist_ok=True)
+        staging_path = STAGING_DIR / f"{stem}.mapped.json"
+        prompt = (
+            f"Load the file at {upload_path}, inspect each column with the "
+            f"available tools, map each to the best canonical field, and save "
+            f"the mapping results to {staging_path}."
         )
 
-        with st.spinner("Asking Claude to map columns..."):
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=1024,
-                system=MAPPER_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_message}],
-            )
-            mappings = json.loads(clean_json_response(response.content[0].text))
+        with st.spinner("Running mapper_agent..."):
+            try:
+                mapper_agent.agent_loop(prompt)
+            except mapper_agent.AgentLoopError as e:
+                st.error(f"mapper_agent did not finish: {e}")
+                return
+
+        if not staging_path.exists():
+            st.error("mapper_agent finished without saving a mapping file.")
+            return
+
+        with open(staging_path, encoding="utf-8") as f:
+            mappings = json.load(f)
 
         # Stashed in session_state (rather than a local variable) so the
         # mapping table below survives the rerun that happens after this
@@ -145,9 +152,8 @@ def render_importer():
         st.subheader("Mapping results")
         st.dataframe(pd.DataFrame(mappings))
 
-        if st.button("Save mapping to Workspace"):
+        if st.button("Confirm"):
             DATA_DIR.mkdir(exist_ok=True)
-            stem = Path(uploaded_file.name).stem
             out_path = DATA_DIR / f"{stem}.mapped.json"
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(mappings, f, indent=2)
@@ -156,20 +162,36 @@ def render_importer():
 
 # --- Page: Workspace -------------------------------------------------------------
 
+WORKSPACE_TABS = {"Customers": "Customer", "Jobs": "Job", "Invoices": "Invoice"}
+
+
 def render_workspace():
     st.header("Workspace")
-    st.write("Browse every mapping the Importer has saved.")
+    st.write("Browse confirmed mappings, grouped by canonical field.")
 
     files = list_mapped_files()
     if not files:
         st.info("No mapped files yet — import one on the Importer page first.")
         return
 
-    choice = st.selectbox("Mapped file", files, format_func=lambda p: p.name)
-    with open(choice, encoding="utf-8") as f:
-        mappings = json.load(f)
+    # Pool every confirmed mapping entry across all files, tagged with its
+    # source filename, so each tab below can filter down to its own field.
+    rows = []
+    for path in files:
+        with open(path, encoding="utf-8") as f:
+            mappings = json.load(f)
+        for entry in mappings:
+            if isinstance(entry, dict):
+                rows.append({"file": path.name, **entry})
+    all_mappings = pd.DataFrame(rows)
 
-    st.dataframe(pd.DataFrame(mappings))
+    for tab, field in zip(st.tabs(list(WORKSPACE_TABS)), WORKSPACE_TABS.values()):
+        with tab:
+            subset = all_mappings[all_mappings.get("canonical_field") == field]
+            if subset.empty:
+                st.info(f"No columns mapped to {field} yet.")
+            else:
+                st.dataframe(subset)
 
 
 # --- Page: Copilot ---------------------------------------------------------------
@@ -205,7 +227,12 @@ def render_copilot():
         context_parts = [
             f"{path.name}:\n{path.read_text(encoding='utf-8')}" for path in list_mapped_files()
         ]
-        context = "\n\n".join(context_parts) or "No imported data yet."
+        # Mapped files store a few real sample_values per column (e.g. to show
+        # what "Customer" looked like in the source file), so this context can
+        # contain emails/phone numbers straight from someone's spreadsheet.
+        # scrub_pii masks those before this ever leaves the machine as part of
+        # the Claude API call below.
+        context = scrub_pii("\n\n".join(context_parts)) or "No imported data yet."
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
