@@ -42,4 +42,8 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       - name: Run tests
-        run: pytest -q tests
+        # `-m pytest` (not the bare `pytest` command) runs it as a module, which
+        # adds the current directory (repo root) to sys.path — that's what
+        # lets `tests/test_pii.py` do `from pii import scrub_pii` and find the
+        # top-level pii.py. Plain `pytest` doesn't add it and fails to import.
+        run: python -m pytest -q tests
