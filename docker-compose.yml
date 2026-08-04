@@ -1,0 +1,18 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    ports:
+      - "8501:8501"
+    env_file:
+      - /home/shiva/.env
+    volumes:
+      - ./uploads:/app/uploads
+
+  processor:
+    build:
+      context: .
+      dockerfile: Dockerfile.processor
+    volumes:
+      - ./uploads:/app/uploads
